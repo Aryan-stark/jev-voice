@@ -118,6 +118,31 @@ def available() -> bool:
         return False
 
 
+def replan(goal: str, remaining: list[dict[str, Any]], reason: str,
+           ctx: Any = None) -> list[dict[str, Any]] | None:
+    """A second attempt at the unfinished tail of a plan, told why the first failed.
+
+    Returns None when it cannot do better, which is the common and correct answer --
+    "the app isn't installed" has no repair. Repeating the failed step is treated as
+    no repair at all, since that is the one thing already known not to work.
+    """
+    failed = remaining[0] if remaining else {}
+    prompt = (
+        f"This step just FAILED: {json.dumps(failed, ensure_ascii=False)}\n"
+        f"Reason: {reason}\n\n"
+        f"The original request was: {goal!r}\n"
+        "Plan a DIFFERENT way to finish it. Do not repeat the failed step unchanged -- "
+        "it is already known not to work. If there is no other way with these tools, "
+        "call cannot_do."
+    )
+    steps, refusal = plan(prompt, ctx=ctx)
+    if refusal or not steps:
+        return None
+    if steps and failed and steps[0] == failed:
+        return None
+    return steps
+
+
 def plan(utterance: str, ctx: Any = None) -> tuple[list[dict[str, Any]], str | None]:
     """Return (steps, refusal). Exactly one is meaningful: a refusal means do nothing.
 

@@ -288,7 +288,7 @@ def handle(brain: Brain, speaker: Speaker, utterance: str, dry: bool, depth: int
             level, step_name = riskiest(steps)
             if level > CONFIRM_ABOVE:
                 rt.hold(describe_steps(steps),
-                        lambda st=steps: run_steps(st), level.name)
+                        lambda st=steps, g=utterance: run_steps(st, goal=g), level.name)
                 reply = (f"That would {step_name.replace('_', ' ')} "
                          f"({level.name.lower()} risk). Say yes to go ahead.")
                 print(f"  ⚠ held: {level.name} via {step_name}")
@@ -304,9 +304,9 @@ def handle(brain: Brain, speaker: Speaker, utterance: str, dry: bool, depth: int
 
             if rec is not None:
                 with rec.stage("execute"):
-                    ok, summary = run_steps(steps)
+                    ok, summary = run_steps(steps, goal=utterance)
             else:
-                ok, summary = run_steps(steps)
+                ok, summary = run_steps(steps, goal=utterance)
             print(f"  ⚙ {summary}")
             speak_reply(speaker, summary if ok else f"That didn't finish: {summary}")
             OVERLAY.set("done" if ok else "error", summary[:70], revert_after=3.0)
@@ -483,19 +483,32 @@ def describe_steps(steps: list) -> str:
     return ", ".join(str(s.get("do")) for s in steps)
 
 
-def run_steps(steps: list) -> tuple[bool, str]:
-    """Run planner-produced steps through the same verified runner the macros use."""
+def run_steps(steps: list, goal: str = "") -> tuple[bool, str]:
+    """Run planner-produced steps through the agent loop.
+
+    The loop retries timing failures -- an app slow to front, a Slack switcher not yet
+    ready -- which are the ones that actually recur here. It does not retry structural
+    failures, and replanning is off by default; see agent.py for the measurements.
+    """
+    from . import agent
     from .macros import _step
 
-    for i, st in enumerate(steps, 1):
+    def step_fn(st: dict) -> tuple[bool, str]:
         try:
             ok, what = _step(st)
         except Exception as e:  # noqa: BLE001
-            ok, what = False, f"{st.get('do')}: {e}"
-        if not ok:
-            return False, f"stopped at step {i} of {len(steps)} ({what})"
+            return False, f"{st.get('do')}: {e}"
         time.sleep(0.25)
-    return True, f"Done ({len(steps)} step{'s' if len(steps) != 1 else ''})."
+        return ok, what
+
+    replan_fn = None
+    if agent.MAX_REPLANS > 0:
+        from . import planner
+        replan_fn = lambda g, rem, why: planner.replan(g, rem, why)  # noqa: E731
+
+    out = agent.run(steps, step_fn, replan_fn=replan_fn,
+                    on_event=lambda m: print(f"    {m}"), goal=goal)
+    return out.ok, out.summary
 
 
 def describe(plan: Plan) -> str:
