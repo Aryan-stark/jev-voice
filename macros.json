@@ -1,0 +1,88 @@
+{
+  "start_my_day": {
+    "description": "Start the working day: open Slack and post 'started' in #general, open the browser with the daily tabs, and open Notes. Say 'start my day', 'wake up', 'good morning', 'set me up', 'morning routine'.",
+    "steps": [
+      {
+        "do": "open_app",
+        "app": "Slack"
+      },
+      {
+        "do": "wait_for_app",
+        "app": "Slack"
+      },
+      {
+        "do": "slack",
+        "to": "#general",
+        "text": "started",
+        "send": true
+      },
+      {
+        "do": "open_app",
+        "app": "Google Chrome"
+      },
+      {
+        "do": "wait_for_app",
+        "app": "Google Chrome"
+      },
+      {
+        "do": "new_tab",
+        "url": "https://mail.google.com"
+      },
+      {
+        "do": "new_tab",
+        "url": "https://calendar.google.com"
+      },
+      {
+        "do": "open_app",
+        "app": "Notes"
+      }
+    ]
+  },
+  "focus_mode": {
+    "description": "Quiet everything down for deep work: mute, quit chat, get back to the browser. Say 'focus mode', 'let me focus', 'do not disturb', 'heads down', 'quiet mode'.",
+    "steps": [
+      {
+        "do": "volume",
+        "level": 0
+      },
+      {
+        "do": "focus_app",
+        "app": "Slack"
+      },
+      {
+        "do": "shortcut",
+        "key": "quit_app"
+      },
+      {
+        "do": "focus_app",
+        "app": "Google Chrome"
+      }
+    ]
+  },
+  "wrap_up": {
+    "description": "End the working day: post 'ended' in Slack #general and leave a note for tomorrow. Say 'wrap up', 'end my day', \"let's end the day\", \"that's me done\", 'good night', 'shutting down'.",
+    "steps": [
+      {
+        "do": "slack",
+        "to": "#general",
+        "text": "ended",
+        "send": true
+      },
+      {
+        "do": "note",
+        "text": "Tomorrow\nPick up where I left off."
+      }
+    ]
+  },
+  "send_break": {
+    "description": "Tell the team you're stepping away: post 'break' in Slack #general. Say 'send break in slack', 'send break', 'I'm on a break', 'taking a break', 'break time', 'going on break'.",
+    "steps": [
+      {
+        "do": "slack",
+        "to": "#general",
+        "text": "break",
+        "send": true
+      }
+    ]
+  }
+}
