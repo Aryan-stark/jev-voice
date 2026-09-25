@@ -23,6 +23,8 @@ import numpy as np
 from . import actions, config
 from .brain import Brain, Plan, split_compound
 from .overlay import NullOverlay
+from .context import Context
+from . import context
 from .runtime import Runtime
 from .telemetry import Recorder
 from .tools import Risk
@@ -255,12 +257,18 @@ def handle(brain: Brain, speaker: Speaker, utterance: str, dry: bool, depth: int
         if planner.available():
             print(f"  ↗ escalating to {planner.model_name()}…")
             OVERLAY.set("thinking", "Working it out…")
+            # The planner gets the machine's state, so "send this to him" can resolve
+            # what the sentence alone cannot. Context is lazy: a request with no
+            # pointing words never pays for the intrusive parts.
+            ctx = Context(rt=rt)
+            if context.needs_context(utterance):
+                print(f"  👁 {ctx.summary()}")
             if rec is not None:
                 rec.set(escalated=True)
                 with rec.stage("planner"):
-                    steps, refusal = planner.plan(utterance)
+                    steps, refusal = planner.plan(utterance, ctx=ctx)
             else:
-                steps, refusal = planner.plan(utterance)
+                steps, refusal = planner.plan(utterance, ctx=ctx)
             if refusal:
                 reply = f"I can't do that: {refusal}"
                 print(f"  ◀ {reply}")

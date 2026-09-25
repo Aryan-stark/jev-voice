@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from . import actions, tools
+from . import actions, context, tools
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 # Must be a NON-thinking model. Qwen3's hybrid models reason in the visible content
@@ -38,6 +38,10 @@ SYSTEM = (
     "If the request cannot be accomplished with these tools, call cannot_do and say why "
     "in one short sentence. Never invent a tool. Never guess at a capability you do not "
     "have. Refusing is always better than doing something close but wrong.\n"
+    "When the state of the computer is given, use it to resolve pointing words. The "
+    "selected text is what 'this' or 'that' refers to; the active window names who "
+    "'him', 'her' or 'them' is. If a pointing word still cannot be resolved from the "
+    "state, call cannot_do rather than guessing at a recipient.\n"
     "A request joined by 'and' or 'then' usually needs ONE CALL PER PART -- "
     "'open chrome and take a note saying hi' is two calls: open_app, then note. "
     "Do not drop a part because you already made one call."
@@ -92,7 +96,9 @@ def _reason_from_text(text: str) -> str:
         text = text[:start].strip()
     for line in text.splitlines():
         line = line.strip()
-        if line and line != "cannot_do" and not line.startswith(("{", "}")):
+        if line.lower().startswith("cannot_do"):       # "cannot_do: <reason>"
+            line = line[len("cannot_do"):].lstrip(" :-").strip()
+        if line and not line.startswith(("{", "}")):
             return line[:140]
     return _FALLBACK_REASON
 
@@ -112,14 +118,29 @@ def available() -> bool:
         return False
 
 
-def plan(utterance: str) -> tuple[list[dict[str, Any]], str | None]:
-    """Return (steps, refusal). Exactly one is meaningful: a refusal means do nothing."""
+def plan(utterance: str, ctx: Any = None) -> tuple[list[dict[str, Any]], str | None]:
+    """Return (steps, refusal). Exactly one is meaningful: a refusal means do nothing.
+
+    `ctx` is a Context. When the request points at something on screen ("send this to
+    him") the sentence alone cannot be resolved, so the machine's state is supplied as
+    a second message -- selectively, since dumping everything buries the signal.
+    """
     apps = actions.running_apps() + actions.installed_apps()[:30]
-    tabs = [t[2] for t in actions.browser_tabs()] if actions.current_browser() else []
+    tabs: list[str] = []
+    messages = [{"role": "system", "content": SYSTEM}]
+    if ctx is not None:
+        deictic = context.needs_context(utterance)
+        state = ctx.for_prompt(want_selection=deictic, want_tabs=True)
+        tabs = [t[2] for t in ctx.open_tabs]
+        messages.append({"role": "user", "content":
+                         "Current state of the computer:\n"
+                         + json.dumps(state, ensure_ascii=False, indent=1)})
+    else:
+        tabs = [t[2] for t in actions.browser_tabs()] if actions.current_browser() else []
+    messages.append({"role": "user", "content": utterance})
     body = json.dumps({
         "model": PLANNER_MODEL,
-        "messages": [{"role": "system", "content": SYSTEM},
-                     {"role": "user", "content": utterance}],
+        "messages": messages,
         "tools": _tools(sorted(set(apps)), tabs),
         "stream": False, "think": False,
         "options": {"temperature": 0},
