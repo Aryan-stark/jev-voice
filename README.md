@@ -62,6 +62,68 @@ longer toggles capitals while the remap is installed.
 | "volume up", "mute", "pause the music", "next song" | system volume / media keys |
 | "take a screenshot", "open my downloads", "lock the screen", "toggle dark mode" | misc |
 | "open notes and type buy milk and press enter" | compound: Jev flags it, code splits it, each step runs in order |
+| "take a note buy milk", "note to self the wifi password is hunter2" | creates a note directly via AppleScript — no window, no keystrokes |
+| "remind me to send the invoice", "add to my todo list pick up the parcel" | creates a Reminder instead (chosen in code from the phrasing) |
+| "go to the claude tab", "close the youtube tab" | switches/closes an **already-open** browser tab, picked from the live tab list |
+| "start dictating" … "stop dictating" | types everything you say verbatim; makes **no API call** while dictating |
+| "undo that", "take that back" | reverses the last reversible action (volume, closed tab, dark mode) |
+| "start my day", "focus mode", "end my day" | runs a saved multi-step routine from `macros.json` |
+
+## Saved routines (`macros.json`)
+
+Multi-step autonomy without a planner. Jev only chooses *which* routine you meant — a
+Choice over the names in your file; the steps are ordinary code that verifies each one
+before moving on, and stops at the first step it cannot confirm.
+
+```json
+{
+  "start_my_day": {
+    "description": "Open Slack, the browser and the editor, plus the daily tabs.",
+    "steps": [
+      {"do": "open_app", "app": "Slack"},
+      {"do": "wait_for_app", "app": "Google Chrome"},
+      {"do": "new_tab", "url": "https://mail.google.com"}
+    ]
+  }
+}
+```
+
+Step kinds: `open_app`, `focus_app`, `wait_for_app`, `open_url`, `new_tab`, `shortcut`,
+`type`, `note`, `reminder`, `volume`, `system`, `wait`. Loaded from `$JEV_MACROS`, else
+`~/.config/jev-voice/macros.json`, else `./macros.json`. A malformed file is reported and
+ignored rather than breaking voice control.
+
+## Dictation mode
+
+Say "start dictating" and every utterance is typed verbatim until "stop dictating". While
+dictating, Jev is bypassed entirely — so it costs nothing, adds no latency, and words like
+"open chrome" get *typed* rather than executed. Exits on the stop phrase, a Caps Lock tap,
+or `DICTATION_IDLE_SECONDS` of silence. Refused in `--always-on`, where an open mic would
+type every overheard remark into the focused window.
+
+## Text entry
+
+Text goes in via the clipboard (⌘V) when that is more reliable — anything long, multi-line,
+emoji-bearing or quote-bearing — and via `keystroke` otherwise. The previous clipboard is
+restored afterwards, but only if nothing else wrote to it in the meantime, so a ⌘C during
+the paste window is never clobbered.
+
+macOS offers no way to confirm a paste landed in the target field; only the clipboard
+*write* is verified. If the field was not focused, the text is silently lost.
+
+## What it can and cannot know
+
+Perception is tiered by permission, which sets a hard ceiling on autonomy:
+
+| Signal | Permission | Used |
+| --- | --- | --- |
+| Installed apps, **running** apps, frontmost app | none | yes |
+| Browser tabs (titles + URLs), Notes, Reminders | Automation, per app | yes |
+| Focused field contents, verifying typed text landed | Accessibility | not yet |
+| Window titles | Screen Recording | no |
+
+Jev also sees the last three turns (what you said, what ran, whether it worked), which is
+what lets "undo that" and "close it" resolve at all — every API call is otherwise stateless.
 
 ## How the Jev layer works (`jev_voice/brain.py`)
 
@@ -100,7 +162,7 @@ focus. `OVERLAY=0` or `--no-overlay` hides it.
 
 `FEEDBACK=ding` (default) plays a chime when an action completes and a low buzz
 on failure. `FEEDBACK=voice` gives spoken replies from a posh butler persona
-(`PERSONA=alfred`, or `cowboy`) using the best British voice installed, or
+(`PERSONA=jarvis`, `alfred`, or `cowboy`) using the best British voice installed, or
 ElevenLabs if `ELEVENLABS_API_KEY` is set (phrases cached to disk, so repeats are
 instant).
 

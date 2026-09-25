@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 jev-voice = "jev_voice.main:main"
+jev-report = "jev_voice.telemetry:main"
 
 [build-system]
 requires = ["hatchling"]

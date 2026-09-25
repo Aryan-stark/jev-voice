@@ -13,8 +13,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+from concurrent.futures import ThreadPoolExecutor
 
-from . import actions, config
+from . import actions, config, macros
+
+# Tabs are a nice-to-have in state; never let them hold up a command.
+TAB_TIMEOUT = float(__import__("os").environ.get("TAB_TIMEOUT", "0.5"))
 
 ACTIONS: dict[str, str] = {
     "open_app": "Launch, open, switch to, or bring up an application program on the Mac (for example Chrome, Cursor, Slack, Finder, Terminal, Notes)",
@@ -29,6 +33,13 @@ ACTIONS: dict[str, str] = {
     "screenshot": "Take a screenshot of the screen",
     "open_folder": "Open a folder like Downloads, Desktop, Documents, or the home folder in Finder",
     "system": "System-level action: lock the screen, put the display to sleep, show the desktop, toggle dark mode, empty the trash",
+    "take_note": "Capture a note, thought, reminder, or to-do item for later, without opening an app (for example 'take a note buy milk', 'note to self the wifi password is hunter2', 'add to my todo list pick up the parcel', 'remind me to send the invoice')",
+    "switch_tab": "Switch to, go to, or bring up an already-open browser tab, named by what is in it (for example 'go to the claude tab', 'switch to the typesafe tab', 'the github one')",
+    "close_named_tab": "Close a specific already-open browser tab named by its content (for example 'close the youtube tab', 'close the claude one')",
+    "start_dictation": "Begin dictation mode: type out everything the user says, word for word, until they say stop (for example 'start dictating', 'take dictation', 'transcribe what I say')",
+    "stop_dictation": "End dictation mode and go back to treating speech as commands (for example 'stop dictating', 'end dictation')",
+    "undo_last": "Reverse an action the ASSISTANT itself just performed on the user's behalf, such as a note it created or a browser tab it closed ('undo that', 'take that back', 'never mind, revert that'). Plain 'undo' meaning the editing undo inside the focused app is `shortcut`, not this.",
+    "run_macro": "Run one of the user's own saved multi-step routines by name (these are listed in the `macro` question; things like a morning setup routine, a focus mode, an end-of-day wrap-up)",
     "stop": "Tell the assistant to stop listening, go to sleep, or exit",
     "none": "Not a command for the computer: conversation, thinking aloud, background chatter, or unintelligible",
 }
@@ -90,6 +101,11 @@ _TRAILING_IN_APP = re.compile(r"\s+(?:in|into|inside|on)\s+(?:the\s+)?(?:[A-Z][\
 _TRAILING_SUBMIT = re.compile(
     r"[\s,.]*(?:and|then)?\s*(?:hit|press|and)\s+(?:enter|return|send|submit)\s*[.!]?$", re.I
 )
+_TODO_RE = re.compile(r"\b(?:to[\- ]?do|todo|task list|remind me|reminder|don'?t forget)\b", re.I)
+_NOTE_LEAD = re.compile(
+    r"^(?:please\s+)?(?:take\s+(?:a\s+)?note|note\s+(?:to\s+self|that|down)?|make\s+a\s+note"
+    r"|jot\s+(?:this\s+)?down|remind\s+me\s+(?:to|that|about)|add\s+to\s+(?:my\s+)?"
+    r"(?:to[\- ]?do|todo|task)\s*list)\b[:,]?\s*(?P<t>.+)$", re.I)
 _SPLIT_COMPOUND = re.compile(r"\s*(?:,\s*)?\b(?:and then|then|and also|and)\b\s*", re.I)
 
 
@@ -108,6 +124,9 @@ def text_candidates(utterance: str) -> dict[str, str]:
         if t and t not in cands:
             cands.append(t)
 
+    m = _NOTE_LEAD.search(utterance)
+    if m:
+        add(m.group("t"))
     m = _TITLE.search(utterance)
     if m:
         add(m.group("t"))
@@ -170,18 +189,39 @@ class Brain:
         )
         # Keep the TCP+TLS connection warm so the first real command is fast.
         try:
-            self.http.get("https://api.typesafe.ai/v1/models")
+            self.http.get(config.TYPESAFE_URL.rsplit("/", 1)[0] + "/models")
         except Exception:
             pass
 
     # ------------------------------------------------------------ questions
 
-    def _questions(self, cands: dict[str, str], apps: list[str]) -> dict[str, Any]:
+    def _questions(self, cands: dict[str, str], apps: list[str],
+                   tabs: list[tuple[int, int, str]] | None = None,
+                   can_undo: bool = False) -> dict[str, Any]:
+        macro_opts = macros.criteria()
+        acts = dict(ACTIONS)
+        if not macro_opts:
+            acts.pop("run_macro", None)
+        else:
+            acts["run_macro"] = (
+                "Run one of the user's own saved multi-step routines. These are triggered "
+                "by set phrases, including greetings and sign-offs that would otherwise "
+                "look like small talk. The routines and the phrases that start them are: "
+                + " | ".join(f"{n}: {d}" for n, d in macro_opts.items()))
+            acts["none"] = (
+                "Not a command for the computer: conversation, thinking aloud, background "
+                "chatter, or unintelligible. Note that a greeting or sign-off that matches "
+                "one of the saved routine phrases above is a command, not chatter.")
+        if not can_undo:
+            acts.pop("undo_last", None)
+        if not tabs:
+            acts.pop("switch_tab", None)
+            acts.pop("close_named_tab", None)
         q: dict[str, Any] = {
             "action": {
                 "type": "choice",
                 "instructions": "The user is speaking a voice command to their Mac. `utterance` is the transcript. Which single kind of action are they asking the computer to perform right now?",
-                "criteria": ACTIONS,
+                "criteria": acts,
             },
             "addressed": {
                 "type": "noul",
@@ -263,34 +303,76 @@ class Brain:
                 "instructions": "Assume the user wants to open a folder in Finder. Which one?",
                 "criteria": {f: None for f in actions.FOLDERS},
             },
+            "tab": {
+                "type": "choice",
+                "instructions": "Assume the user wants to switch to or close a browser tab that is already open. `tabs` lists the open tabs by title. Which tab do they mean? Match on meaning: 'the claude tab' means a tab whose title mentions Claude. Choose `none` if no open tab matches.",
+                "criteria": {**{f"t{i}": t[2][:110] for i, t in enumerate(tabs or [])},
+                             "none": "No open tab matches what the user said"},
+            },
+            "macro": {
+                "type": "choice",
+                "instructions": "Assume the user wants to run one of their own saved routines. Which one do they mean?",
+                "criteria": {**macro_opts, "none": "None of these routines matches"},
+            },
             "system_op": {
                 "type": "choice",
                 "instructions": "Assume the user wants a system-level action. Which one?",
                 "criteria": {"lock": "lock the screen", "sleep_display": "put the display / screen to sleep", "show_desktop": "show the desktop", "toggle_dark_mode": "switch between dark and light mode", "empty_trash": "empty the trash"},
             },
         }
+        if not tabs:
+            q.pop("tab", None)
+        if not macro_opts:
+            q.pop("macro", None)
         return q
 
     # ------------------------------------------------------------ inference
 
-    def evaluate(self, utterance: str, front: str | None = None) -> Plan:
+    def evaluate(self, utterance: str, front: str | None = None,
+                 rt: Any = None) -> Plan:
+        # Enumerating tabs costs an AppleScript round-trip (~100-150ms), so overlap it
+        # with the local work instead of paying for it serially.
+        tabs: list[tuple[int, int, str]] = []
+        pool: Any = None
+        if actions.current_browser():
+            pool = ThreadPoolExecutor(max_workers=1)
+            fut = pool.submit(actions.browser_tabs)
         apps = actions.installed_apps()
         cands = text_candidates(utterance)
+        frontmost = front if front is not None else actions.frontmost_app()
+        running = actions.running_apps()
+        if pool is not None:
+            try:
+                tabs = fut.result(timeout=TAB_TIMEOUT)
+            except Exception:  # noqa: BLE001
+                tabs = []
+            pool.shutdown(wait=False)
         state = {
             "utterance": utterance,
-            "frontmost_app": front if front is not None else actions.frontmost_app(),
+            "frontmost_app": frontmost,
             "apps": apps,
+            "running_apps": running,
             "candidates": cands,
         }
-        payload = {"state": state, "model": self.model, "questions": self._questions(cands, apps)}
+        if tabs:
+            state["tabs"] = {f"t{i}": t[2][:110] for i, t in enumerate(tabs)}
+        if rt is not None and rt.recent():
+            # Gives pronouns an antecedent: "close it", "do that again", "undo that".
+            state["recent_turns"] = rt.recent()
+        can_undo = bool(rt is not None and rt.undo_stack)
+        if can_undo:
+            state["undoable"] = rt.undo_stack[-1].label
+        payload = {"state": state, "model": self.model,
+                   "questions": self._questions(cands, apps, tabs, can_undo)}
         t0 = time.perf_counter()
         r = self.http.post(config.TYPESAFE_URL, json=payload)
         r.raise_for_status()
         data = r.json()
         ms = int((time.perf_counter() - t0) * 1000)
-        return self._to_plan(utterance, data["answers"], cands, ms)
+        return self._to_plan(utterance, data["answers"], cands, ms, tabs)
 
-    def _to_plan(self, utterance: str, ans: dict[str, Any], cands: dict[str, str], ms: int) -> Plan:
+    def _to_plan(self, utterance: str, ans: dict[str, Any], cands: dict[str, str], ms: int,
+                 tabs: list[tuple[int, int, str]] | None = None) -> Plan:
         act = ans["action"]
         action = act["choice"]
         conf = float(act["confidence"])
@@ -357,6 +439,24 @@ class Brain:
         elif action == "system":
             op, c = ch("system_op")
             args["op"] = op
+            conf = min(conf, c)
+        elif action == "run_macro":
+            m, c = ch("macro") if "macro" in ans else ("none", 0.0)
+            args["macro"] = m
+            conf = min(conf, c)
+        elif action == "take_note":
+            tkey, _c = ch("text")
+            args["text"] = cands.get(tkey, utterance)
+            args["kind"] = "reminder" if _TODO_RE.search(utterance) else "note"
+            # Deliberately not min()'d with the span confidence: the candidates are
+            # near-duplicates ("send the invoice" vs "remind me to send the invoice")
+            # and either makes an acceptable note, so splitting the vote between them
+            # must not veto the action.
+        elif action in ("switch_tab", "close_named_tab"):
+            tkey, c = ch("tab") if "tab" in ans else ("none", 0.0)
+            i = int(tkey[1:]) if tkey.startswith("t") and tkey[1:].isdigit() else -1
+            if tabs and 0 <= i < len(tabs):
+                args["win"], args["tab"], args["title"] = tabs[i]
             conf = min(conf, c)
 
         # "in the notes app": focus that app before acting inside it

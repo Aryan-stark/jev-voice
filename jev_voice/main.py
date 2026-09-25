@@ -23,6 +23,11 @@ import numpy as np
 from . import actions, config
 from .brain import Brain, Plan, split_compound
 from .overlay import NullOverlay
+from .runtime import Runtime
+from .telemetry import Recorder
+from .tools import Risk
+from . import tools
+from .macros import run as run_macro
 from .persona import flavor
 from .tts import Speaker
 
@@ -41,10 +46,11 @@ def ding(path: str) -> None:
     subprocess.Popen(["afplay", "-v", "0.4", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def execute(plan: Plan, dry: bool = False) -> str:
+def execute(plan: Plan, dry: bool = False, rt: Runtime | None = None) -> str:
     """Run the plan. Returns the short spoken confirmation."""
     a = plan.args
     act = plan.action
+    rt = rt or Runtime()
     if act == "none":
         return ""
     if act == "stop":
@@ -67,7 +73,9 @@ def execute(plan: Plan, dry: bool = False) -> str:
     if act == "open_app":
         if a["app"] == "none":
             return "I don't see that app."
-        actions.open_app(a["app"])
+        # Verify rather than assume: `open -a` succeeding does not mean the app appeared.
+        if not actions.open_app(a["app"], verify=2.5):
+            return f"I couldn't open {a['app']}."
         return f"Opening {a['app']}."
     if act == "open_website":
         actions.open_url(a["url"])
@@ -87,6 +95,11 @@ def execute(plan: Plan, dry: bool = False) -> str:
         actions.scroll(a["direction"], a["amount"])
         return ""
     if act == "volume":
+        try:
+            prev = actions.get_volume()
+            rt.push_undo("the volume change", lambda: actions.set_volume(prev))
+        except Exception:  # noqa: BLE001
+            pass
         return actions.volume(a["op"])
     if act == "media":
         actions.media(a["op"])
@@ -98,36 +111,274 @@ def execute(plan: Plan, dry: bool = False) -> str:
         actions.open_folder(a["folder"])
         return f"Opening {a['folder']}."
     if act == "system":
+        if a["op"] == "toggle_dark_mode":
+            rt.push_undo("the appearance change",
+                         lambda: actions.system("toggle_dark_mode"))
         return actions.system(a["op"])
+    if act == "run_macro":
+        name = a.get("macro", "none")
+        if name == "none":
+            return "I don't have a routine for that."
+        ok, summary = run_macro(name, dry)
+        print(f"  ⚙ {summary}")
+        return summary if ok else f"I couldn't finish that: {summary}"
+    if act == "take_note":
+        text = a.get("text", "").strip()
+        if not text:
+            return "There was nothing to note."
+        if a.get("kind") == "reminder":
+            return actions.reminder_capture(text)
+        reply, _nid = actions.note_capture(text)
+        # No undo entry: Notes cannot delete or edit a note via AppleScript, so an
+        # "undo" here would report success and change nothing.
+        return reply
+    if act == "switch_tab":
+        if "win" not in a:
+            return "I don't see that tab."
+        if not actions.activate_tab(a["win"], a["tab"]):
+            return "I couldn't switch to that tab."
+        return f"{a.get('title', 'That tab')[:40]}."
+    if act == "close_named_tab":
+        if "win" not in a:
+            return "I don't see that tab."
+        title = a.get("title", "")
+        url = actions.tab_url(a["win"], a["tab"])   # capture before closing, so undo can reopen
+        if not actions.close_tab(a["win"], a["tab"]):
+            return "I couldn't close that tab."
+        if url:
+            rt.push_undo("closing that tab", lambda: actions.open_in_new_tab(url))
+        return f"Closed {title[:40]}."
+    if act == "start_dictation":
+        if os.environ.get("JEV_MODE") == "always-on":
+            return "Dictation needs hold-to-talk or hands-free mode."
+        rt.start_dictation()
+        return "Dictating."
+    if act == "stop_dictation":
+        rt.stop_dictation()
+        return "Done dictating."
+    if act == "undo_last":
+        u = rt.pop_undo()
+        if u is None:
+            return "There's nothing to undo."
+        try:
+            u.revert()
+        except Exception:  # noqa: BLE001
+            return f"I couldn't undo {u.label}."
+        return f"Undid {u.label}."
     return ""
 
 
-def handle(brain: Brain, speaker: Speaker, utterance: str, dry: bool, depth: int = 0, plan: Plan | None = None) -> bool:
+_STOP_DICT = re.compile(
+    r"\b(?:stop|end|finish|cancel|quit)\s+(?:the\s+)?dictat(?:ing|ion)\b"
+    r"|\bthat'?s (?:the end|it) (?:of|for) (?:the )?dictation\b", re.I)
+
+
+def handle(brain: Brain, speaker: Speaker, utterance: str, dry: bool, depth: int = 0,
+           plan: Plan | None = None, rt: Runtime | None = None,
+           rec: "Recorder | None" = None) -> bool:
     """Returns False when the user asked to stop."""
+    rt = rt or Runtime()
+    # Sub-steps of a compound command share the parent's record.
+    own_record = rec is None and depth == 0
+    if own_record:
+        rec = Recorder(mode="text")
+    if rec is not None and depth == 0:
+        rec.set(transcript=utterance)
+
+    # A held action is answered locally: "yes"/"no" must never cost an API round-trip,
+    # and must never be re-interpreted as a fresh command.
+    if rt.pending is not None and depth == 0 and plan is None:
+        if rt.pending.expired():
+            rt.pending = None
+        elif _NO.match(utterance):
+            held = rt.take_pending()
+            reply = "Cancelled."
+            print(f"  ◀ {reply} (was: {held.description if held else ''})")
+            speak_reply(speaker, reply)
+            OVERLAY.set("idle", "Cancelled", revert_after=2.0)
+            if rec is not None:
+                rec.set(action="cancelled", ok=True, reply=reply)
+                if own_record:
+                    rec.write()
+            return True
+        elif _YES.match(utterance):
+            held = rt.take_pending()
+            if held is None:
+                reply = "That's expired -- say it again."
+            else:
+                print(f"  ⚙ confirmed: {held.description}")
+                ok, reply = held.run()
+            speak_reply(speaker, reply)
+            OVERLAY.set("done", reply[:70], revert_after=3.0)
+            if rec is not None:
+                rec.set(action="confirmed", ok=True, reply=reply)
+                if own_record:
+                    rec.write()
+            return True
+
+    # Dictation short-circuits the model entirely: no API call, and no chance that
+    # dictated words like "open chrome" get executed as a command.
+    if rt.dictating and depth == 0 and plan is None:
+        if _STOP_DICT.search(utterance):
+            rt.stop_dictation()
+            print("  ✍ dictation off")
+            OVERLAY.set("done", "Dictation off", revert_after=2.0)
+            if FEEDBACK == "voice":
+                speaker.say(flavor("Done dictating."))
+            else:
+                ding(SOUND_STOP)
+            return True
+        if rt.dictation_expired():
+            rt.stop_dictation()
+            print("  ✍ dictation timed out")
+        else:
+            print(f"  ✍ {utterance}")
+            if not dry:
+                actions.type_text(utterance + " ")
+            rt.touch_dictation()
+            OVERLAY.set("done", f"✍ {utterance}", revert_after=1.5)
+            return True
+
     OVERLAY.set("thinking", f"{utterance}")
-    plan = plan or brain.evaluate(utterance)
+    plan = plan or brain.evaluate(utterance, rt=rt)
     print(f"  → {plan}")
+    if rec is not None and depth == 0:
+        rec.mark("jev", plan.latency_ms)
+        rec.set(action=plan.action, confidence=round(plan.confidence, 3))
+
+    # Jev must pick one of its ~20 actions, so an out-of-vocabulary request comes back
+    # either as `none` or as a low-confidence nearest match. In both cases guessing is
+    # worse than thinking, so hand it to the planner, which is allowed to refuse.
+    if depth == 0 and not dry and _should_escalate(plan):
+        from . import planner
+
+        if planner.available():
+            print(f"  ↗ escalating to {planner.model_name()}…")
+            OVERLAY.set("thinking", "Working it out…")
+            if rec is not None:
+                rec.set(escalated=True)
+                with rec.stage("planner"):
+                    steps, refusal = planner.plan(utterance)
+            else:
+                steps, refusal = planner.plan(utterance)
+            if refusal:
+                reply = f"I can't do that: {refusal}"
+                print(f"  ◀ {reply}")
+                speak_reply(speaker, reply)
+                OVERLAY.set("error", reply[:70], revert_after=4.0)
+                rt.record(utterance, "refused", reply, False)
+                if rec is not None:
+                    rec.set(refused=True, ok=True, reply=reply)
+                    if own_record:
+                        rec.write()
+                return True
+            print(f"  ⚙ plan: {[s.get('do') for s in steps]}")
+            if rec is not None:
+                rec.set(plan_steps=[str(s.get("do")) for s in steps])
+
+            # A model-authored plan doesn't get to do something destructive unasked.
+            level, step_name = riskiest(steps)
+            if level > CONFIRM_ABOVE:
+                rt.hold(describe_steps(steps),
+                        lambda st=steps: run_steps(st), level.name)
+                reply = (f"That would {step_name.replace('_', ' ')} "
+                         f"({level.name.lower()} risk). Say yes to go ahead.")
+                print(f"  ⚠ held: {level.name} via {step_name}")
+                print(f"  ◀ {reply}")
+                speak_reply(speaker, reply)
+                OVERLAY.set("error", reply[:70], revert_after=6.0)
+                rt.record(utterance, "held", reply, True)
+                if rec is not None:
+                    rec.set(ok=True, reply=reply, action="held")
+                    if own_record:
+                        rec.write()
+                return True
+
+            if rec is not None:
+                with rec.stage("execute"):
+                    ok, summary = run_steps(steps)
+            else:
+                ok, summary = run_steps(steps)
+            print(f"  ⚙ {summary}")
+            speak_reply(speaker, summary if ok else f"That didn't finish: {summary}")
+            OVERLAY.set("done" if ok else "error", summary[:70], revert_after=3.0)
+            rt.record(utterance, "planned", summary, ok)
+            if rec is not None:
+                rec.set(ok=ok, reply=summary, error="" if ok else summary)
+                if own_record:
+                    rec.write()
+            return True
+
     if plan.args.get("compound") and depth == 0:
         parts = split_compound(utterance)
         if len(parts) > 1:
             print(f"  compound: {parts}")
+            if rec is not None:
+                rec.set(plan_steps=parts)
             for p in parts:
-                if not handle(brain, speaker, p, dry, depth=1):
+                if not handle(brain, speaker, p, dry, depth=1, rt=rt, rec=rec):
                     return False
                 time.sleep(0.35)  # let the previous app/page come up
+            if rec is not None:
+                rec.set(ok=True, reply=f"compound: {len(parts)} parts")
+                if own_record:
+                    rec.write()
+            return True
+    if plan.action == "run_macro" and plan.confidence >= config.ACTION_MIN_CONFIDENCE:
+        ack = flavor("On it.")
+        print(f"  ◀ {ack}")
+        OVERLAY.set("thinking", f"{describe(plan)}…")
+        if FEEDBACK == "voice":
+            speaker.say(ack)
+    # Same gate as the planner path: a confident classification is not a licence to
+    # destroy something. Jev reaching `empty_trash` at 1.00 is exactly the dangerous case.
+    if depth == 0 and not dry:
+        level, what = plan_risk(plan)
+        if level > CONFIRM_ABOVE:
+            rt.hold(describe(plan), lambda p=plan: (True, execute(p, False, rt=rt)),
+                    level.name)
+            reply = (f"That would {describe(plan).lower()} "
+                     f"({level.name.lower()} risk). Say yes to go ahead.")
+            print(f"  ⚠ held: {level.name} via {what}")
+            print(f"  ◀ {reply}")
+            speak_reply(speaker, reply)
+            OVERLAY.set("error", reply[:70], revert_after=6.0)
+            if rec is not None:
+                rec.set(action="held", ok=True, reply=reply)
+                if own_record:
+                    rec.write()
             return True
     try:
-        reply = execute(plan, dry)
+        if rec is not None:
+            with rec.stage("execute"):
+                reply = execute(plan, dry, rt=rt)
+        else:
+            reply = execute(plan, dry, rt=rt)
     except Exception as e:  # noqa: BLE001
         reply = "That failed."
         print(f"  ! {e}")
+        if rec is not None:
+            rec.set(error=f"{type(e).__name__}: {e}")
     if reply == "__stop__":
+        if rec is not None:
+            rec.set(ok=True, reply="stop")
+            if own_record:
+                rec.write()
         if FEEDBACK == "voice":
             speaker.say(flavor("Bye."))
         else:
             ding(SOUND_STOP)
         return False
-    failed = reply in ("That failed.", "Not sure what you meant.", "I don't see that app.") or reply.startswith("I couldn't")
+    failed = (reply in ("That failed.", "Not sure what you meant.", "I don't see that app.",
+                        "I don't see that tab.", "There's nothing to undo.",
+                        "There was nothing to note.")
+              or reply.startswith("I couldn't"))
+    if depth == 0 and plan.action != "none":
+        rt.record(utterance, plan.action, reply, not failed)
+    if rec is not None and depth == 0:
+        rec.set(ok=not failed, reply=reply)
+        if own_record:
+            rec.write()
     if reply:
         line = flavor(reply) if not dry else reply
         print(f"  ◀ {line}")
@@ -148,6 +399,97 @@ def handle(brain: Brain, speaker: Speaker, utterance: str, dry: bool, depth: int
     return True
 
 
+ESCALATE_BELOW = float(os.environ.get("ESCALATE_BELOW_CONFIDENCE", "0.55"))
+# A bad guess in these is destructive or outward-facing, so they escalate sooner.
+_RISKY = {"system", "shortcut", "type_text"}
+
+
+def _should_escalate(plan: Plan) -> bool:
+    if plan.action in ("stop", "start_dictation", "stop_dictation", "undo_last"):
+        return False
+    if plan.action == "none":
+        # Jev judged this wasn't aimed at the computer at all -- believe it, unless it
+        # also thinks it was addressed, which is the "command I can't perform" case.
+        return float(plan.args.get("addressed", 0)) >= 0.6
+    if plan.action in _RISKY:
+        return plan.confidence < max(ESCALATE_BELOW, 0.75)
+    return plan.confidence < ESCALATE_BELOW
+
+
+def speak_reply(speaker: Speaker, line: str) -> None:
+    if FEEDBACK == "voice":
+        speaker.say(flavor(line))
+    else:
+        ding(SOUND_DONE)
+
+
+# Above this risk, a model-authored plan must be confirmed before it runs.
+# MEDIUM and below execute automatically; HIGH and CRITICAL ask first.
+CONFIRM_ABOVE = Risk[os.environ.get("CONFIRM_ABOVE_RISK", "MEDIUM").upper()]
+_YES = re.compile(r"^\W*(?:yes|yep|yeah|yup|ok|okay|sure|do it|go ahead|go on|confirm|"
+                  r"send it|send|proceed|please do)\b", re.I)
+_NO = re.compile(r"^\W*(?:no|nope|don'?t|stop|cancel|never ?mind|forget it|abort|wait)\b", re.I)
+
+
+# Jev's action vocabulary -> the registry tool whose risk applies. Actions absent here
+# are either harmless or handled entirely inside execute().
+_ACTION_TOOL = {
+    "system": "system", "shortcut": "shortcut", "type_text": "type",
+    "open_app": "open_app", "open_website": "open_url", "web_search": "web_search",
+    "scroll": "scroll", "volume": "volume", "media": "media", "screenshot": "screenshot",
+    "open_folder": "open_folder", "take_note": "note", "switch_tab": "switch_tab",
+    "close_named_tab": "close_tab", "new_item": "shortcut",
+}
+
+
+def plan_risk(plan: Plan) -> tuple[Risk, str]:
+    """Risk of one of Jev's own direct actions.
+
+    This path is the common one -- Jev answers confidently and executes without ever
+    consulting the planner -- so it needs the same gate a model-authored plan gets.
+    """
+    tool = _ACTION_TOOL.get(plan.action)
+    if tool is None:
+        return Risk.NONE, plan.action
+    a = plan.args
+    args: dict = {}
+    if plan.action == "system":
+        args = {"op": a.get("op", "")}
+    elif plan.action in ("shortcut", "new_item"):
+        args = {"key": a.get("shortcut", "")}
+    return tools.risk_of(tool, args), plan.action
+
+
+def riskiest(steps: list) -> tuple[Risk, str]:
+    """The highest risk in a plan, and the step that carries it."""
+    worst, worst_name = Risk.NONE, ""
+    for st in steps:
+        name = str(st.get("do") or "")
+        r = tools.risk_of(name, {k: v for k, v in st.items() if k != "do"})
+        if r > worst:
+            worst, worst_name = r, name
+    return worst, worst_name
+
+
+def describe_steps(steps: list) -> str:
+    return ", ".join(str(s.get("do")) for s in steps)
+
+
+def run_steps(steps: list) -> tuple[bool, str]:
+    """Run planner-produced steps through the same verified runner the macros use."""
+    from .macros import _step
+
+    for i, st in enumerate(steps, 1):
+        try:
+            ok, what = _step(st)
+        except Exception as e:  # noqa: BLE001
+            ok, what = False, f"{st.get('do')}: {e}"
+        if not ok:
+            return False, f"stopped at step {i} of {len(steps)} ({what})"
+        time.sleep(0.25)
+    return True, f"Done ({len(steps)} step{'s' if len(steps) != 1 else ''})."
+
+
 def describe(plan: Plan) -> str:
     """Short human label for the overlay, e.g. 'Open Google Chrome'."""
     a = plan.args
@@ -165,6 +507,14 @@ def describe(plan: Plan) -> str:
         "screenshot": lambda: "Screenshot",
         "open_folder": lambda: f"Open {a.get('folder')}",
         "system": lambda: f"{a.get('op', '').replace('_', ' ').capitalize()}",
+        "run_macro": lambda: f"Routine: {a.get('macro', '?').replace('_', ' ')}",
+        "take_note": lambda: ("Reminder" if a.get("kind") == "reminder" else "Note")
+                             + f": {a.get('text', '')[:50]}",
+        "switch_tab": lambda: f"Tab: {a.get('title', '?')[:50]}",
+        "close_named_tab": lambda: f"Close tab: {a.get('title', '?')[:50]}",
+        "start_dictation": lambda: "Dictation on",
+        "stop_dictation": lambda: "Dictation off",
+        "undo_last": lambda: "Undo",
         "stop": lambda: "Bye",
     }.get(act, lambda: act)() + (f"  ·  in {a['in_app']}" if a.get("in_app") else "")
 
@@ -172,7 +522,7 @@ def describe(plan: Plan) -> str:
 def run_text(args: argparse.Namespace) -> None:
     brain = Brain()
     speaker = Speaker(enabled=not args.quiet)
-    handle(brain, speaker, args.text, args.dry_run)
+    handle(brain, speaker, args.text, args.dry_run, rt=Runtime())
 
 
 class Session:
@@ -185,6 +535,9 @@ class Session:
         if not actions.accessibility_ok():
             print("⚠ Accessibility permission missing: System Settings → Privacy & Security → Accessibility → add your terminal.")
         self.args = args
+        self.mode = ("ptt" if args.ptt else "always-on" if args.always_on
+                     else "hold" if args.hold else "smart")
+        self.rt = Runtime()
         self.stt = WhisperServer()
         self.stt.start()
         self.brain = Brain()
@@ -200,15 +553,23 @@ class Session:
         """Transcribe + plan + execute. Returns False on 'stop'."""
         if len(pcm) < config.SAMPLE_RATE * 0.25:
             return True
+        secs = len(pcm) / config.SAMPLE_RATE
+        rec = Recorder(mode=self.mode)
+        rec.set(audio_seconds=round(secs, 2), wake_source="ptt")
         t0 = time.perf_counter()
         text = self.stt.transcribe(pcm)
         stt_ms = int((time.perf_counter() - t0) * 1000)
+        rec.mark("stt", stt_ms)
         if not text:
             print("  (heard nothing)")
+            # A blank transcript is a real signal: false endpoint, or silence.
+            rec.set(transcript="", ok=None, reply="(heard nothing)")
+            rec.write()
             return True
-        print(f"🗣  {text}   ({len(pcm)/config.SAMPLE_RATE:.1f}s audio, stt {stt_ms}ms)")
+        print(f"🗣  {text}   ({secs:.1f}s audio, stt {stt_ms}ms)")
         self.listener.pause(0.3)
-        ok = handle(self.brain, self.speaker, text, self.args.dry_run)
+        ok = handle(self.brain, self.speaker, text, self.args.dry_run, rt=self.rt, rec=rec)
+        rec.write()
         if self.speaker.speaking():
             self.listener.pause(0.9)
         self.listener.drain()
@@ -259,6 +620,14 @@ def strip_wake(text: str) -> tuple[bool, str]:
 
 # ------------------------------------------------------------------ modes
 
+def ready(s: "Session") -> None:
+    """Announce readiness the way FEEDBACK asks for."""
+    if FEEDBACK == "voice":
+        s.speaker.say(flavor("Ready."))
+    else:
+        ding(SOUND_DONE)
+
+
 def run_smart(s: Session) -> None:
     """Hands-free. Mic is always open; only utterances that name the assistant (or follow
     a command within FOLLOWUP_SECONDS, or follow a Caps Lock tap) are sent to Jev."""
@@ -271,6 +640,12 @@ def run_smart(s: Session) -> None:
 
     def on_press() -> None:
         s.speaker.interrupt()
+        if s.rt.dictating:            # physical escape hatch out of dictation
+            s.rt.stop_dictation()
+            print("  ✍ dictation off (Caps Lock)")
+            OVERLAY.set("done", "Dictation off", revert_after=2.0)
+            ding(SOUND_STOP)
+            return
         ding(SOUND_START)
         arm(10.0)
 
@@ -291,42 +666,61 @@ def run_smart(s: Session) -> None:
     while True:
         pcm = s.listener.next_utterance()
         OVERLAY.set("heard", "Transcribing…")
+        rec = Recorder(mode="smart")
+        rec.set(audio_seconds=round(len(pcm) / config.SAMPLE_RATE, 2))
         t0 = time.perf_counter()
         text = s.stt.transcribe(pcm)
         stt_ms = int((time.perf_counter() - t0) * 1000)
+        rec.mark("stt", stt_ms)
         if not text:
             OVERLAY.set("idle", IDLE_LABEL, revert_after=0.1)
+            rec.set(transcript="", reply="(heard nothing)")
+            rec.write()
             continue
         OVERLAY.set("heard", text)
+        rec.set(transcript=text)
         addressed, cmd = strip_wake(text)
+        rec.set(addressed=addressed, wake_source="wake_word" if addressed else "none")
         if not addressed and time.monotonic() < armed["until"]:
             addressed, cmd = True, text
+            rec.set(wake_source="armed")
         if not cmd and addressed:        # just the name: acknowledge and wait for the command
             ding(SOUND_START)
             arm(FOLLOWUP_SECONDS)
+            rec.set(action="wake_only", ok=True, reply="(armed)")
+            rec.write()
             continue
         gate = None
         if not addressed:
             if not UNNAMED_COMMANDS:
                 print(f"   ·  {text}   (ignored: no name, stt {stt_ms}ms)")
                 OVERLAY.set("idle", f"Ignored: {text}", revert_after=2.5)
+                rec.set(action="ignored", reply="no wake word")
+                rec.write()
                 continue
             # No name: let Jev judge whether this is a command for the computer at all.
-            gate = s.brain.evaluate(text)
+            gate = s.brain.evaluate(text, rt=s.rt)
+            rec.mark("jev", gate.latency_ms)
             ok_cmd = (gate.args.get("addressed", 0) >= UNNAMED_MIN_ADDRESSED
                       and gate.confidence >= UNNAMED_MIN_CONFIDENCE)
             if ok_cmd and gate.action == "none":
                 print(f"   ·  {text}   (Jev: none, addressed={gate.args.get('addressed')} conf={gate.confidence:.2f}, stt {stt_ms}ms)")
+                rec.set(action="none", confidence=round(gate.confidence, 3), reply="(not a command)")
+                rec.write()
                 continue
             if not ok_cmd:
                 print(f"   ·  {text}   (ignored: addressed={gate.args.get('addressed')} {gate.action} conf={gate.confidence:.2f}, stt {stt_ms}ms)")
                 OVERLAY.set("idle", f"Ignored: {text}", revert_after=2.5)
+                rec.set(action="ignored", confidence=round(gate.confidence, 3),
+                        reply="below unnamed gate")
+                rec.write()
                 continue
             cmd = text
         tag = f", addressed={gate.args.get('addressed')}" if gate else ""
         print(f"🗣  {cmd}   ({len(pcm)/config.SAMPLE_RATE:.1f}s audio, stt {stt_ms}ms{tag})")
         s.listener.pause(0.3)
-        ok = handle(s.brain, s.speaker, cmd, s.args.dry_run, plan=gate)
+        ok = handle(s.brain, s.speaker, cmd, s.args.dry_run, plan=gate, rt=s.rt, rec=rec)
+        rec.write()
         if s.speaker.speaking():
             s.listener.pause(0.9)
         s.listener.drain()
@@ -403,7 +797,7 @@ def run_capslock(s: Session) -> None:
                 sys.exit(3)
             perms = request_permissions()
     print(f"⌨️  Hold CAPS LOCK and speak. Tap it to toggle hands-free. (Jev {s.brain.model}, whisper base.en, voice {s.speaker.engine}:{s.speaker.voice})")
-    s.speaker.say(flavor("Ready."))
+    ready(s)
     while True:
         pcm = done.get()
         if not s.process(pcm):
@@ -411,8 +805,9 @@ def run_capslock(s: Session) -> None:
 
 
 def run_always_on(s: Session) -> None:
+    os.environ["JEV_MODE"] = "always-on"
     print(f"🎙  Listening (Jev {s.brain.model}, whisper base.en). Say 'stop listening' to quit.")
-    s.speaker.say(flavor("Ready."))
+    ready(s)
     s.listener.pause(0.8)
     while True:
         pcm = s.listener.next_utterance()
