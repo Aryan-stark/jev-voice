@@ -2,20 +2,50 @@
 
 Talk to your Mac. You speak, it opens apps, types, searches, scrolls, presses keys.
 
-Everything runs locally except one ~250 ms call to **Jev** (TypeSafe's System One
+Everything runs locally except one ~440 ms call to **Jev** (TypeSafe's System One
 model), which turns the transcript into a typed action plus typed arguments in a
 single fan-out request. Jev never generates text; code produces candidate values
 and Jev *selects*. Code owns execution.
 
 ```
-mic ─► energy VAD ─► whisper.cpp (Metal, ~100 ms) ─► Jev (1 request, ~250 ms) ─► macOS actions ─► `say`
+speech
+  │
+  ├─ energy VAD ─► whisper.cpp (Metal, ~56 ms)         local, nothing leaves the Mac
+  │
+  ├─ wake word ("Sofia") ─► Jev  (1 request, ~440 ms)  classifier over 21 actions
+  │                          │
+  │        confident ────────┤                         → execute
+  │                          │
+  │   none-but-addressed, ───┘                         → escalate
+  │   or low confidence
+  │        │
+  │        └─ local planner (Ollama, ~1 s, free)       plans from the same tools,
+  │                          │                          or refuses outright
+  │                          ▼
+  └────────────────► risk gate ─► agent loop ─► verify
+                      (HIGH asks    (retries
+                       first)        timing failures)
 ```
+
+Two properties matter more than the model:
+
+- **A classifier is never forced to guess.** Jev must pick one of its actions, so an
+  out-of-vocabulary request used to become the nearest neighbour and run — "mute slack
+  notifications until 3pm" routed to `system(lock)` and locked the screen. Those cases
+  now go to a local planner that is allowed to say *"I can't do that"*.
+- **Nothing destructive happens unasked.** Every action carries a risk level; above
+  MEDIUM it is held and spoken back for confirmation, answered locally by yes/no.
 
 ## Setup (macOS, Apple Silicon)
 
 ```sh
 cp .env.example .env                       # add your TYPESAFE_API_KEY from console.typesafe.ai
 ./scripts/setup.sh
+
+# The escalation tier — without this, out-of-vocabulary requests are refused
+# outright instead of being planned.
+brew install ollama && ollama serve &
+ollama pull qwen3:4b-instruct-2507-q4_K_M
 ```
 
 The script installs whisper-cpp + ffmpeg, downloads the model, syncs the Python
@@ -142,14 +172,18 @@ Code reads only the answers the chosen action needs. Plan confidence is the
 minimum over the judgements used. Below `ACTION_MIN_CONFIDENCE` (0.35) it says
 "not sure" instead of acting. Thresholds live in `jev_voice/config.py`.
 
-## Latency (Mac mini M4, measured)
+## Latency (MacBook Air M5 / 16 GB, measured)
 
 | Stage | Time |
 | --- | --- |
 | End-of-speech detection | 550 ms of silence (tune `VADConfig.end_silence_ms`) |
-| whisper.cpp base.en | 80–130 ms |
-| Jev fan-out | 170–420 ms |
-| Execute + `say` | ~50–100 ms |
+| whisper.cpp base.en | ~56 ms |
+| Jev fan-out | 380–630 ms (median ~440) |
+| Local planner, when it escalates | ~1 s |
+| Execute + verify | 100–900 ms, depending on the action |
+
+Only the ~10–20 % of commands Jev is unsure about pay the planner cost; the rest take the
+fast path. `jev-report` gives these numbers for your own machine rather than this table.
 
 ## Floating transcription pill
 
@@ -170,19 +204,104 @@ instant).
 
 ```
 jev_voice/
-  main.py     loop, CLI, compound handling
-  brain.py    Jev questions, candidate extraction, Plan
-  actions.py  macOS execution (open, keystrokes, scroll, volume, media keys…)
-  audio.py    mic + VAD endpointing
-  stt.py      whisper-server client
-  tts.py      macOS `say`
-  config.py   env / thresholds
-  hotkey.py   Caps Lock (remapped to F18) global key tap
-  overlay.py  floating transcription pill (AppKit)
-  persona.py  butler / cowboy phrasing
+  main.py       loop, CLI, escalation, risk gate, dictation, compound handling
+  brain.py      Jev questions, candidate extraction, Plan
+  actions.py    macOS execution (apps, keystrokes, clipboard, Notes, tabs, Slack…)
+  tools.py      capability registry — one definition per action, with risk metadata
+  planner.py    escalation tier: local model plans from the registry, or refuses
+  agent.py      act → observe → verify → repair, with failure classification
+  context.py    what the machine looks like now, gathered lazily
+  runtime.py    session state: dictation, recent turns, undo, held actions
+  macros.py     saved multi-step routines (macros.json)
+  telemetry.py  per-utterance event log + `jev-report`
+  ax.py         Accessibility reads, used to verify before acting
+  audio.py      mic + VAD endpointing
+  stt.py        whisper-server client
+  tts.py        macOS `say` / ElevenLabs
+  config.py     env / thresholds
+  hotkey.py     Caps Lock (remapped to F18) global key tap
+  overlay.py    floating transcription pill (AppKit)
+  persona.py    jarvis / butler / cowboy phrasing
+macros.json     your routines
 scripts/
-  setup.sh    one-shot install: deps, model, Caps Lock remap, launcher, permissions
+  setup.sh      one-shot install: deps, model, Caps Lock remap, launcher, permissions
 ```
+
+## The capability registry (`tools.py`)
+
+Every action is declared once. The planner derives its tool schemas from it, the macro
+runner dispatches through it, and the risk gate reads its metadata — so adding a
+capability in one place makes it plannable, scriptable and gated at the same time.
+
+Each tool carries `risk` (NONE…CRITICAL), `reversible`, and `needs_focus` — the last
+because steps that need keyboard focus can never be run concurrently: `open -a` fights
+over frontmost and keystrokes land wherever focus happens to be.
+
+Risk can escalate per call: `system(empty_trash)` is HIGH while `system(toggle_dark_mode)`
+is MEDIUM.
+
+## The planner (`planner.py`)
+
+Runs locally and offline through [Ollama](https://ollama.com). Default model:
+`qwen3:4b-instruct-2507-q4_K_M`.
+
+It **must be a non-thinking model.** Qwen3's hybrid models reason in the visible content
+stream even with `think=false`, costing 7–25 s per plan; the `-instruct-2507` line has no
+thinking mode and answers in ~1 s with better accuracy (9/9 vs timeouts on the same set).
+
+```sh
+ollama pull qwen3:4b-instruct-2507-q4_K_M
+```
+
+`PLANNER=0` disables it — Jev then guesses, as it used to.
+
+## The agent loop (`agent.py`)
+
+Retries **timing** failures (an app slow to front, a Slack switcher not yet ready), which
+are the ones that actually recur. It does not retry structural failures — an app that
+isn't installed will not become installed on a second attempt.
+
+Replanning is built but **off by default**, on measurement rather than principle: against
+the real structural failures this system produces it repaired 1 of 4, and that one turned
+"open Notion" (not installed) into a web search for *"how to open Notion on Mac"*, which
+it reported as success. A plausible-looking wrong action claiming `ok` is worse than a
+clean failure. `AGENT_MAX_REPLANS=1` opts back in.
+
+## Context (`context.py`)
+
+"Send this to him" can't be answered from the sentence — it needs the state of the
+machine. With Slack open on a conversation and text selected:
+
+```
+"send this to him"  →  slack(to="@Rahul", text="Meeting moved to 4 PM")
+```
+
+*"him"* comes from the active window title, *"this"* from the selection. With nothing
+selected and no conversation open, the same phrase **refuses** rather than inventing a
+recipient.
+
+Gathered lazily, because it isn't free: the frontmost app costs ~1.5 ms and running apps
+~2 ms, but enumerating browser tabs costs ~225 ms. Only utterances containing a pointing
+word ("this", "that", "him", "it") pay for the expensive parts.
+
+Reading the selection presses ⌘C — the system-wide Accessibility focused element is
+unavailable and per-app reads come back empty on Electron apps, so the clean route
+doesn't exist. The pasteboard is snapshotted and restored, and an *unchanged* pasteboard
+is read as "nothing was selected". `SELECTION_VIA_CLIPBOARD=0` disables it.
+
+## Telemetry (`jev-report`)
+
+Every utterance writes one JSON line — transcript, per-stage timings, wake-word match,
+confidence, escalation, refusal, outcome.
+
+```sh
+jev --ptt        # a session
+jev-report       # median/p95 latency by stage, wake-word hit rate,
+                 # escalation rate, refusals, failures with their errors
+```
+
+Blank transcripts are logged too: a false endpoint is a measurement, not a non-event.
+Writing is best-effort — an unwritable log directory can never break a command.
 
 ## License
 
